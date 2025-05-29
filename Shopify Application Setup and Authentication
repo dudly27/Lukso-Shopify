@@ -1,0 +1,547 @@
+// server.js
+import 'dotenv/config'; // Load environment variables
+import express from 'express';
+// import bodyParser from 'body-parser'; // Replaced with express.json()
+import { Shopify, LATEST_API_VERSION, DeliveryMethod } from '@shopify/shopify-api';
+import '@shopify/shopify-api/rest/index.js'; // Import REST resources (if needed for other parts of your app)
+import { ethers } from 'ethers';
+import LSP8Contract from '@lukso/lsp-smart-contracts/artifacts/LSP8IdentifiableDigitalAsset.json';
+import ERC20ABI from './abis/ERC20.json'; // Make sure this ABI file is accessible
+
+// --- Environment Variable Checks (Crucial!) ---
+const requiredEnvVars = [
+    'SHOPIFY_API_KEY', 'SHOPIFY_API_SECRET', 'SHOPIFY_APP_SCOPES', 'SHOPIFY_APP_URL',
+    'LUKSO_MINTING_PRIVATE_KEY', 'LUKSO_RPC_URL'
+];
+for (const envVar of requiredEnvVars) {
+    if (!process.env[envVar]) {
+        console.error(`Error: Missing required environment variable ${envVar}`);
+        process.exit(1);
+    }
+}
+
+const {
+    SHOPIFY_API_KEY, SHOPIFY_API_SECRET, SHOPIFY_APP_SCOPES,
+    LUKSO_MINTING_PRIVATE_KEY, LUKSO_RPC_URL
+} = process.env; // Removed unused HOST variable
+
+const SHOPIFY_APP_URL = process.env.SHOPIFY_APP_URL;
+const APP_PORT = process.env.PORT || 3000;
+// IMPORTANT: For production, pin to a specific Shopify API version you've tested against.
+// Example: '2025-04'. Using LATEST_API_VERSION is fine for development but can lead to
+// unexpected breaking changes in production when Shopify updates it.
+const SHOPIFY_API_VERSION_TO_USE = '2025-04'; // Or your preferred version e.g. LATEST_API_VERSION for dev
+
+// --- Lukso & Shopify Utility Functions ---
+
+async function updateShopifyCustomerProfile({ session, customerId, luksoAddress }) {
+    const graphQLClient = new Shopify.Clients.Graphql({ session });
+    const mutation = `
+        mutation customerUpdate($id: ID!, $metafields: [MetafieldsSetInput!]!) {
+            customerUpdate(input: { id: $id, metafields: $metafields }) {
+                customer { id }
+                userErrors { field message }
+            }
+        }
+    `;
+    try {
+        const response = await graphQLClient.query({
+            data: {
+                query: mutation,
+                variables: {
+                    id: customerId,
+                    metafields: [{
+                        namespace: "lukso", key: "profile_address",
+                        value: luksoAddress, type: "single_line_text_field"
+                    }]
+                }
+            }
+        });
+        console.log('Shopify customer metafield update response:', response.body.data?.customerUpdate);
+        if (response.body.data?.customerUpdate?.userErrors?.length > 0) {
+            throw new Error(response.body.data.customerUpdate.userErrors.map(e => e.message).join(', '));
+        }
+        return response.body.data.customerUpdate;
+    } catch (error) {
+        console.error('Error updating Shopify customer profile:', error.response?.errors || error.message);
+        throw error; // Re-throw to be handled by the route
+    }
+}
+
+async function mintLSP8NFT({ recipient, tokenId, metadataURI, contractAddress }) {
+    if (!LUKSO_MINTING_PRIVATE_KEY) {
+        throw new Error('LUKSO_MINTING_PRIVATE_KEY is not set in environment variables.');
+    }
+    const provider = new ethers.providers.JsonRpcProvider(LUKSO_RPC_URL);
+    const wallet = new ethers.Wallet(LUKSO_MINTING_PRIVATE_KEY, provider);
+    const contract = new ethers.Contract(contractAddress, LSP8Contract.abi, wallet);
+
+    try {
+        console.log(`Attempting to mint LSP8 NFT to ${recipient} with tokenId ${tokenId}...`);
+        // Consider adding gas parameters if needed (e.g., { gasLimit: 300000, gasPrice: ethers.utils.parseUnits('10', 'gwei') })
+        const tx = await contract.mint(recipient, tokenId, true, '0x' /*, { gasLimit: YOUR_GAS_LIMIT_IF_NEEDED } */);
+        const receipt = await tx.wait();
+        console.log('Mint transaction hash:', tx.hash, 'Mined in block:', receipt.blockNumber);
+
+        // Setting LSP4Metadata. The value for `LSP4Metadata` is typically a bytes representation of the metadata URI.
+        // `ethers.utils.defaultAbiCoder.encode(['string'], [metadataURI])` is one way to get bytes.
+        // Another common way, if the URI itself is desired as simple bytes, is `ethers.utils.toUtf8Bytes(metadataURI)`.
+        // Verify the exact format expected by your LSP8 contract's consumers or implementation.
+        const metadataBytesValue = ethers.utils.defaultAbiCoder.encode(['string'], [metadataURI]);
+        // const metadataBytesValue = ethers.utils.toUtf8Bytes(metadataURI); // Alternative if simpler byte string needed
+
+        // Note: These are two separate transactions. If setData fails, the mint is not rolled back.
+        // Consider implementing retry logic for setData or an off-chain tracking mechanism for pending metadata updates.
+        const setDataTx = await contract.setData(
+            ethers.utils.keccak256(ethers.utils.toUtf8Bytes('LSP4Metadata')),
+            metadataBytesValue
+            /*, { gasLimit: YOUR_GAS_LIMIT_IF_NEEDED } */
+        );
+        await setDataTx.wait();
+        console.log('Metadata set transaction hash:', setDataTx.hash);
+        return tx.hash;
+    } catch (error) {
+        console.error('Error minting LSP8 NFT:', error);
+        throw error;
+    }
+}
+
+async function updateShopifyProductWithNFT({ session, productId, nftTokenId }) {
+    const graphQLClient = new Shopify.Clients.Graphql({ session });
+    const mutation = `
+        mutation productUpdate($id: ID!, $metafields: [MetafieldsSetInput!]!) {
+            productUpdate(input: { id: $id, metafields: $metafields }) {
+                product { id }
+                userErrors { field message }
+            }
+        }
+    `;
+    try {
+        const response = await graphQLClient.query({
+            data: {
+                query: mutation,
+                variables: {
+                    id: productId,
+                    metafields: [{
+                        namespace: "lukso", key: "nft_token_id",
+                        value: nftTokenId.toString(), type: "single_line_text_field"
+                    }]
+                }
+            }
+        });
+        console.log('Shopify product metafield update response:', response.body.data?.productUpdate);
+         if (response.body.data?.productUpdate?.userErrors?.length > 0) {
+            throw new Error(response.body.data.productUpdate.userErrors.map(e => e.message).join(', '));
+        }
+        return response.body.data.productUpdate;
+    } catch (error) {
+        console.error('Error updating Shopify product with NFT:', error.response?.errors || error.message);
+        throw error;
+    }
+}
+
+async function getLuksoTokenBalance({ tokenAddress, userAddress }) {
+    const provider = new ethers.providers.JsonRpcProvider(LUKSO_RPC_URL);
+    const contract = new ethers.Contract(tokenAddress, ERC20ABI, provider);
+    try {
+        const balance = await contract.balanceOf(userAddress);
+        // Assumes 18 decimals, which is common. If interacting with tokens that have
+        // different decimal places, this should be fetched from the contract or configured.
+        return ethers.utils.formatUnits(balance, 18);
+    } catch (error) {
+        console.error('Error getting Lukso token balance:', error);
+        throw error;
+    }
+}
+
+// --- Shopify App Setup & Initialization ---
+
+// !! CRITICAL FOR PRODUCTION !!
+// `MemorySessionStorage` is for development and testing ONLY.
+// In production, you MUST use a persistent session storage solution like Redis, PostgreSQL,
+// or another database to ensure sessions are not lost on server restarts or deploys.
+//
+// Example for a custom session storage (adapt to your chosen database):
+// class MyDatabaseSessionStorage extends Shopify.Session.CustomSessionStorage {
+//   constructor(dbConnection) { // e.g., pass your database client
+//     super();
+//     this.db = dbConnection;
+//     // Initialize database table if it doesn't exist, etc.
+//   }
+//   async storeSession(session) {
+//     // const query = "INSERT INTO shopify_sessions (id, shop, state, ...) VALUES (...) ON CONFLICT (id) DO UPDATE SET ...";
+//     // await this.db.query(query, [session.id, session.shop, session.state, ...]);
+//     console.log(`Storing session for shop: ${session.shop}, ID: ${session.id}`);
+//     // Implement actual database storage logic here
+//     return true; // Return true if successful
+//   }
+//   async loadSession(id) {
+//     // const { rows } = await this.db.query("SELECT * FROM shopify_sessions WHERE id = $1", [id]);
+//     // if (rows.length === 0) return undefined;
+//     // const dbRow = rows[0];
+//     // const session = new Shopify.Session.Session(dbRow.id, dbRow.shop, dbRow.state, dbRow.isOnline);
+//     // session.accessToken = dbRow.accessToken; // etc.
+//     console.log(`Loading session for ID: ${id}`);
+//     // Implement actual database loading logic here
+//     return undefined; // or return the Session object if found
+//   }
+//   async deleteSession(id) {
+//     // await this.db.query("DELETE FROM shopify_sessions WHERE id = $1", [id]);
+//     console.log(`Deleting session for ID: ${id}`);
+//     // Implement actual database deletion logic here
+//     return true;
+//   }
+//   async deleteSessions(ids) { // Optional, but good for cleanup
+//     // await this.db.query("DELETE FROM shopify_sessions WHERE id = ANY($1::text[])", [ids]);
+//     console.log(`Deleting sessions for IDs: ${ids.join(', ')}`);
+//     return true;
+//   }
+//   async findSessionsByShop(shop) { // Optional, but good for cleanup/multi-user apps
+//     // const { rows } = await this.db.query("SELECT * FROM shopify_sessions WHERE shop = $1", [shop]);
+//     // return rows.map(dbRow => /* convert to Session object */);
+//     console.log(`Finding sessions for shop: ${shop}`);
+//     return [];
+//   }
+// }
+// Shopify.Context.initialize({ ..., SESSION_STORAGE: new MyDatabaseSessionStorage(yourDbConnection) });
+
+Shopify.Context.initialize({
+    API_KEY: SHOPIFY_API_KEY,
+    API_SECRET_KEY: SHOPIFY_API_SECRET,
+    SCOPES: SHOPIFY_APP_SCOPES.split(","),
+    HOST_NAME: SHOPIFY_APP_URL.replace(/^https?:\/\//, ""),
+    HOST_SCHEME: SHOPIFY_APP_URL.split("://")[0],
+    IS_EMBEDDED_APP: true,
+    API_VERSION: SHOPIFY_API_VERSION_TO_USE, // Use the defined API version
+    SESSION_STORAGE: new Shopify.Session.MemorySessionStorage(), // REPLACE FOR PRODUCTION
+    // Ensure these scopes are sufficient for both online (API) and offline (webhook) needs.
+});
+
+// --- Webhook Handlers ---
+
+const handleOrderFulfilledWebhook = async ({ topic, shop, body: payload }) => {
+    console.log(`Received webhook: ${topic} from ${shop}`);
+    const order = JSON.parse(payload); // Payload is a string, parse it to JSON
+
+    const customerIdGid = order.customer?.admin_graphql_api_id; // GID for customer
+    const orderIdGid = order.admin_graphql_api_id; // GID for order
+    const lineItems = order.line_items;
+
+    if (!customerIdGid) {
+        console.log(`Order ${orderIdGid} has no customer. Skipping Lukso processing.`);
+        return;
+    }
+
+    const offlineSession = await Shopify.Utils.loadOfflineSession(shop);
+    if (!offlineSession) {
+        console.error(`No offline session found for shop ${shop}. Cannot process webhook ${orderIdGid}.`);
+        return; // Critical to have an offline session for background tasks
+    }
+    const gqlClient = new Shopify.Clients.Graphql({ session: offlineSession });
+
+    let luksoAddress = null;
+    try {
+        const customerQuery = `
+            query customer($id: ID!) {
+                customer(id: $id) {
+                    metafield(namespace: "lukso", key: "profile_address") { value }
+                }
+            }
+        `;
+        const customerRes = await gqlClient.query({
+            data: { query: customerQuery, variables: { id: customerIdGid } }
+        });
+        luksoAddress = customerRes.body.data?.customer?.metafield?.value;
+    } catch (fetchError) {
+        console.error(`Error fetching customer metafield for customer ${customerIdGid} on shop ${shop}:`, fetchError.response?.errors || fetchError.message);
+        return; // Depending on the error, you might want to stop or retry later
+    }
+
+    if (luksoAddress) {
+        for (const item of lineItems) {
+            // Ensure product_id exists and the product itself still exists in Shopify.
+            if (!item.product_id || !item.product_exists) {
+                console.log(`Product for line item ${item.id} (Product ID: ${item.product_id}, Variant ID: ${item.variant_id}) does not exist or is invalid. Skipping NFT minting.`);
+                continue;
+            }
+            const shopifyProductIDGid = `gid://shopify/Product/${item.product_id}`;
+
+            const productMetafieldQuery = `
+                query product($id: ID!) {
+                    product(id: $id) {
+                        nftContractAddressMetafield: metafield(namespace: "lukso", key: "nft_contract_address") { value }
+                        nftBaseUriMetafield: metafield(namespace: "lukso", key: "nft_base_uri") { value }
+                        nftMintedTokenId: metafield(namespace: "lukso", key: "nft_token_id") { value }
+                    }
+                }
+            `;
+            let productInfo;
+            try {
+                 productInfo = await gqlClient.query({
+                    data: { query: productMetafieldQuery, variables: { id: shopifyProductIDGid } }
+                });
+            } catch(productFetchError) {
+                 console.error(`Error fetching product metafields for product GID ${shopifyProductIDGid} on shop ${shop}:`, productFetchError.response?.errors || productFetchError.message);
+                 continue; // Skip this item
+            }
+
+            const nftContractAddress = productInfo.body.data?.product?.nftContractAddressMetafield?.value;
+            const nftBaseUri = productInfo.body.data?.product?.nftBaseUriMetafield?.value;
+            const existingNftTokenId = productInfo.body.data?.product?.nftMintedTokenId?.value;
+
+            if (existingNftTokenId) {
+                console.log(`NFT already minted for product ${shopifyProductIDGid} (Token ID: ${existingNftTokenId}) in order ${orderIdGid}. Skipping.`);
+                continue;
+            }
+
+            if (nftContractAddress && nftBaseUri) {
+                const tokenId = ethers.utils.keccak256(
+                    ethers.utils.toUtf8Bytes(`${orderIdGid}-${item.id}-${customerIdGid}-${Date.now()}`) // item.id is line_item_id
+                );
+                const metadataURI = `${nftBaseUri}/${tokenId}.json`; // Assuming tokenId can be part of the URI path
+
+                try {
+                    const txHash = await mintLSP8NFT({
+                        recipient: luksoAddress, tokenId, metadataURI, contractAddress: nftContractAddress
+                    });
+                    console.log(`NFT minted for order ${orderIdGid}, item ${item.id}. Tx: ${txHash}, TokenID: ${tokenId}`);
+
+                    await updateShopifyProductWithNFT({
+                        session: offlineSession,
+                        productId: shopifyProductIDGid, // Use the correct Product GID
+                        nftTokenId: tokenId
+                    });
+                    console.log(`Shopify product ${shopifyProductIDGid} updated with NFT ID ${tokenId}.`);
+                } catch (mintError) {
+                    console.error(`Failed to mint or update Shopify for order ${orderIdGid}, item ${item.id}:`, mintError);
+                    // Implement retry logic or alert merchant if critical
+                }
+            } else {
+                 console.log(`Product ${shopifyProductIDGid} is not configured for NFT minting (missing lukso:nft_contract_address or lukso:nft_base_uri metafields).`);
+            }
+        }
+    } else {
+        console.log(`Customer ${customerIdGid} on shop ${shop} has no Lukso profile connected. Skipping NFT minting for order ${orderIdGid}.`);
+    }
+};
+
+// GDPR Webhook Handlers (Mandatory for public apps - Implement actual data handling)
+const handleCustomersRedactWebhook = async ({ topic, shop, body }) => {
+    const payload = JSON.parse(body);
+    console.log(`Received ${topic} from ${shop}. Payload for customer IDs:`, payload.customer_ids, `Shop ID: ${payload.shop_id}`);
+    // TODO: Implement customer data redaction.
+    // For each customer_id in payload.customer_ids:
+    // 1. Find any data you store related to this customer_id and shop_id.
+    // 2. Erase or anonymize this data from your database(s).
+    // This includes any Lukso addresses or related info if you store it mapped to Shopify customer IDs.
+    // Respond with 200 OK.
+};
+const handleShopRedactWebhook = async ({ topic, shop, body }) => {
+    const payload = JSON.parse(body);
+    console.log(`Received ${topic} from ${shop}. Payload for shop ID:`, payload.shop_id);
+    // TODO: Implement shop data redaction.
+    // 1. Find all data you store related to this payload.shop_id.
+    // 2. Erase all this data from your database(s). This means the merchant has uninstalled your app
+    //    and all their shop's data and their customers' data (that you hold on their behalf) must be removed.
+    // This includes all sessions, settings, Lukso integration details, etc.
+    // Respond with 200 OK.
+};
+const handleCustomersDataRequestWebhook = async ({ topic, shop, body }) => {
+    const payload = JSON.parse(body);
+    console.log(`Received ${topic} from ${shop}. Payload for customer ID:`, payload.customer_id, `Shop ID: ${payload.shop_id}`);
+    // TODO: Implement customer data request.
+    // 1. Find any data you store related to payload.customer_id and payload.shop_id.
+    // 2. Collect this data (e.g., in JSON format).
+    // 3. You are obligated to provide this data to the merchant (via email specified in payload.orders_to_redact or similar)
+    //    so they can fulfill the customer's data request. Shopify does not proxy the data itself.
+    //    Your app needs a mechanism to securely deliver this data to the merchant.
+    // Respond with 200 OK.
+};
+
+Shopify.Webhooks.Registry.addHandler("ORDERS_FULFILLED", {
+    path: "/webhooks",
+    webhookHandler: handleOrderFulfilledWebhook,
+    deliveryMethod: DeliveryMethod.Http,
+});
+Shopify.Webhooks.Registry.addHandler("CUSTOMERS_REDACT", {
+    path: "/webhooks",
+    webhookHandler: handleCustomersRedactWebhook,
+    deliveryMethod: DeliveryMethod.Http,
+});
+Shopify.Webhooks.Registry.addHandler("SHOP_REDACT", {
+    path: "/webhooks",
+    webhookHandler: handleShopRedactWebhook,
+    deliveryMethod: DeliveryMethod.Http,
+});
+Shopify.Webhooks.Registry.addHandler("CUSTOMERS_DATA_REQUEST", {
+    path: "/webhooks",
+    webhookHandler: handleCustomersDataRequestWebhook,
+    deliveryMethod: DeliveryMethod.Http,
+});
+
+
+// --- Express App Setup ---
+const app = express();
+
+// Middleware for parsing JSON bodies (Shopify webhooks are JSON)
+// Also used for your API endpoints if they accept JSON.
+app.use(express.json());
+
+
+// --- Shopify Auth Routes ---
+app.get('/auth/begin', async (req, res) => {
+    try {
+        const authRoute = await Shopify.Auth.beginAuth(
+            req,
+            res,
+            req.query.shop,
+            '/auth/callback',
+            false // isOnline: false for offline token (long-lived access)
+        );
+        console.log(`Redirecting to Shopify for auth: ${authRoute}`);
+        res.redirect(authRoute);
+    } catch (error) {
+        console.error("Error during auth begin:", error);
+        res.status(500).send(error.message);
+    }
+});
+
+app.get('/auth/callback', async (req, res) => {
+    try {
+        const session = await Shopify.Auth.validateAuthCallback(req, res, req.query);
+        await Shopify.Context.SESSION_STORAGE.storeSession(session);
+        console.log(`Auth successful for shop ${session.shop}. Offline session stored.`);
+
+        const responses = await Shopify.Webhooks.Registry.registerAll({
+            shop: session.shop,
+            accessToken: session.accessToken,
+        });
+        console.log("Webhook registration responses:", JSON.stringify(responses, null, 2));
+        // Check responses for success/failure, e.g., if(!responses['ORDERS_FULFILLED'].success) ...
+
+        res.redirect(`/?host=${Buffer.from(`${session.shop}/admin`).toString('base64')}&shop=${session.shop}`);
+    } catch (error) {
+        console.error("Error during auth callback:", error.message, error.stack, error.response?.data);
+        if (error instanceof Shopify.Errors.InvalidOAuthError) {
+            res.status(400).send(error.message);
+        } else if (error instanceof Shopify.Errors.CookieNotFound || error instanceof Shopify.Errors.SessionNotFound) {
+            res.redirect(`/auth/begin?shop=${req.query.shop}`);
+        } else {
+            res.status(500).send(error.message);
+        }
+    }
+});
+
+// --- Middleware for API endpoint authentication (called from App Bridge frontend) ---
+async function authenticateApiRequest(req, res, next) {
+    try {
+        const authorization = req.headers.authorization;
+        if (!authorization || !authorization.startsWith('Bearer ')) {
+            return res.status(401).json({ success: false, message: 'Unauthorized: Missing Bearer token.' });
+        }
+        const sessionToken = authorization.substring(7); // Remove "Bearer "
+        const payload = await Shopify.Auth.decodeSessionToken(sessionToken); // Verifies the token
+
+        // payload.sid is the Shopify session ID for an online token.
+        // This session should have been stored after an online token exchange,
+        // typically when the embedded app first loads.
+        const session = await Shopify.Context.SESSION_STORAGE.loadSession(payload.sid);
+
+        if (!session || !session.accessToken) { // Online sessions also have an accessToken
+             return res.status(401).json({ success: false, message: 'Unauthorized: Invalid or expired session.' });
+        }
+        res.locals.shopify = { session }; // Make the online session available
+        next();
+    } catch (error) {
+        console.error("API Authentication error:", error.message);
+        let statusCode = 500;
+        let message = `Unauthorized: ${error.message}`;
+        if (error instanceof Shopify.Errors.InvalidJwtError) {
+            statusCode = 401;
+        } else if (error instanceof Shopify.Errors.SessionNotFound) { // Catch specific session not found error
+            statusCode = 401;
+            message = 'Unauthorized: Session not found. Please re-authenticate.';
+        }
+        // Add more specific error checks if needed
+        return res.status(statusCode).json({ success: false, message });
+    }
+}
+
+// Apply authentication middleware to all /api routes
+app.use('/api', authenticateApiRequest);
+
+
+// --- Your App's API Endpoints ---
+app.post('/api/connect-lukso-profile', async (req, res) => {
+    const { customerId, luksoAddress } = req.body;
+    const session = res.locals.shopify.session; // Authenticated online session from middleware
+
+    if (!customerId || !luksoAddress) {
+        return res.status(400).json({ success: false, message: 'Missing customerId or luksoAddress.' });
+    }
+
+    try {
+        // This uses the online session's accessToken. Ensure SHOPIFY_APP_SCOPES include write_customers.
+        await updateShopifyCustomerProfile({ session, customerId, luksoAddress });
+        res.json({ success: true, message: 'Lukso profile connected and customer metafield updated.' });
+    } catch (error) {
+        res.status(500).json({ success: false, message: 'Failed to connect Lukso profile.', error: error.message });
+    }
+});
+
+app.get('/api/lukso-token-balance', async (req, res) => {
+    const { tokenAddress, userAddress } = req.query;
+
+    if (!tokenAddress || !userAddress) {
+        return res.status(400).json({ success: false, message: 'Missing tokenAddress or userAddress.' });
+    }
+
+    try {
+        const balance = await getLuksoTokenBalance({ tokenAddress, userAddress });
+        res.json({ success: true, balance });
+    } catch (error) {
+        res.status(500).json({ success: false, message: 'Failed to get token balance.', error: error.message });
+    }
+});
+
+
+// --- Webhook Route ---
+app.post('/webhooks', express.text({ type: '*/*' }), async (req, res) => { // express.text for raw body for Shopify verification
+    try {
+        // `Shopify.Webhooks.Registry.process` will find the handler and execute it.
+        // It also handles HMAC verification and sending the 200 OK response to Shopify.
+        // Ensure the body is passed as a string for verification if not using express.json() for this specific route
+        // However, Shopify library might handle JSON parsing internally if header indicates application/json.
+        // The Shopify CLI generated apps often use express.text() for the webhook route then JSON.parse() in handler.
+        // Given the handlers use JSON.parse(payload), and Shopify sends JSON, this should be okay.
+        // The Shopify library will access req.body (if parsed by express.json) or use rawBody (if provided from express.text).
+        // Sticking to express.json() globally might be simpler if Shopify library handles raw body access correctly.
+        // Let's keep express.json() global and trust Shopify.Webhooks.Registry.process.
+        // If HMAC verification fails, remove global express.json() and use express.text for /webhooks,
+        // then parse in handlers.
+        await Shopify.Webhooks.Registry.process(req, res);
+        console.log("Webhook processed successfully.");
+    } catch (error) {
+        console.error('Error processing webhook:', error.message, error.stack);
+        if (!res.headersSent) {
+            res.status(500).send('Error processing webhook');
+        }
+    }
+});
+
+// --- Root Route & Server Start ---
+app.get('/', (req, res) => {
+    const { shop, host } = req.query;
+    if (shop) {
+        res.send(`<h1>Welcome to your Lukso Shopify App!</h1><p>Installed on shop: ${shop}. Host: ${host ? Buffer.from(host, 'base64').toString() : 'N/A'}</p><p>You should be seeing this inside the Shopify Admin if the redirect was successful.</p>`);
+    } else {
+        res.send("<h1>Lukso Shopify App</h1> <p>Please install the app through the Shopify Admin or initiate authentication via /auth/begin?shop=your-shop-name.myshopify.com</p>");
+    }
+});
+
+app.listen(APP_PORT, () => {
+    console.log(`Shopify App backend listening on port ${APP_PORT}`);
+    console.log(`Ensure ngrok or similar is forwarding to this port if testing locally: ${SHOPIFY_APP_URL}`);
+    console.log(`Initiate auth at: ${SHOPIFY_APP_URL}/auth/begin?shop=your-shop.myshopify.com`);
+    console.log(`Using Shopify API Version: ${SHOPIFY_API_VERSION_TO_USE}`);
+});
