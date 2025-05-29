@@ -1,0 +1,8 @@
+graph TD
+    A[Shopify Storefront] --> B[Shopify App Block/Embed (Client-side React)]
+    B -- Fetch Data / Trigger Action --> C[Your Shopify App Backend (Node.js/Express)]
+    C -- Shopify Admin API Calls --> D[Shopify Admin API]
+    C -- Lukso RPC / Blockchain Interaction --> E[Lukso Network]
+    F[Shopify Admin] --> G[Your App's Admin UI]
+    G -- Save Settings --> C
+    D -- Webhooks --> C
